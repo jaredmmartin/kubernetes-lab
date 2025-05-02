@@ -1,0 +1,51 @@
+#cloud-config
+autoinstall:
+  version: 1
+  early-commands:
+    - "systemctl stop ssh"
+  identity:
+    hostname: "ubuntu"
+    username: "vagrant"
+    password: "$6$CG/3wG6U6vagDFjC$WjSNjZaL/CqK/8SwMO0ARqvY614BG2LceS9ZEGr6K9PQhIDnNmlZVEG6z2LmoDYK0XYtP7emnR5Pte4j7DUoA0"
+  late-commands:
+    - "echo 'Defaults:vagrant !requiretty' > /target/etc/sudoers.d/vagrant"
+    - "echo 'vagrant ALL=(ALL) NOPASSWD: ALL' >> /target/etc/sudoers.d/vagrant"
+    - "chmod 440 /target/etc/sudoers.d/vagrant"
+  packages:
+    - net-tools
+    - nfs-common
+    - nfs-kernel-server
+    - openssh-server
+  ssh:
+    install-server: true
+    allow-pw: true
+  storage:
+    config:
+      - grub_device: true
+        id: disk-sda
+        path: /dev/sda
+        ptable: gpt
+        type: disk
+        wipe: superblock-recursive
+      - device: disk-sda
+        flag: bios_grub
+        id: partition-0
+        number: 1
+        size: 1048576
+        type: partition
+      - device: disk-sda
+        id: partition-1
+        number: 2
+        size: -1
+        type: partition
+        wipe: superblock
+      - fstype: ext4
+        id: format-0
+        type: format
+        volume: partition-1
+      - device: format-0
+        id: mount-0
+        path: /
+        type: mount
+  timezone: America/Denver
+  updates: all

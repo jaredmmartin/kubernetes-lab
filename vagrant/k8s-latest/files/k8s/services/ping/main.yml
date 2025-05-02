@@ -1,0 +1,294 @@
+---
+- hosts: all
+  become: false
+  tasks:
+    - name: check if pingctl is already present
+      ansible.builtin.stat:
+        path: /home/vagrant/pingctl
+      register: pingctl_stat
+
+    - name: install pingctl
+      when: not pingctl_stat.stat.exists
+      block:
+        - name: download pingctl installer
+          ansible.builtin.get_url:
+            dest: ./pingctl-install
+            url: https://bit.ly/pingctl-install
+          register: pingctl_installer
+
+        - name: install pingctl
+          ansible.builtin.shell: sh {{ pingctl_installer.dest }}
+
+    - name: create .pingidentity directory
+      ansible.builtin.file:
+        path: .pingidentity
+        state: directory
+
+    - name: copy pingctl config
+      ansible.builtin.copy:
+        dest: .pingidentity/config
+        src: files/pingctl-config
+
+    - name: create pf namespace
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: pf
+        state: present
+      register: pf_namespace
+
+    - name: generate ping devops secrets
+      ansible.builtin.shell: ./pingctl k8s generate devops-secret | kubectl --namespace {{ pf_namespace.result.metadata.name }} apply -f -
+
+    - name: add pingidentity repository to helm
+      kubernetes.core.helm_repository:
+        name: pingidentity
+        repo_url: https://helm.pingidentity.com/
+
+    - name: install pf via helm
+      kubernetes.core.helm:
+        chart_ref: pingidentity/ping-devops
+        name: pf
+        release_namespace: "{{ pf_namespace.result.metadata.name }}"
+        state: present
+        update_repo_cache: true
+        release_values:
+          global:
+            workload:
+              statefulSet:
+                partition: 0
+                persistentvolume:
+                  enabled: true
+                  volumes:
+                    out-dir:
+                      mountPath: /opt/out
+                      persistentVolumeClaim:
+                        accessModes:
+                          - ReadWriteMany
+                        storageClassName: nfs-client
+                        resources:
+                          requests:
+                            storage: 4Gi
+                    in-dir:
+                      mountPath: /opt/in
+                      persistentVolumeClaim:
+                        accessModes:
+                          - ReadWriteMany
+                        storageClassName: nfs-client
+                        resources:
+                          requests:
+                            storage: 2Gi
+          securityContext:
+            fsGroup: 0
+            runAsUser: 9031
+            runAsGroup: 0
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          pingaccess-admin:
+            enabled: false
+          pingaccess-engine:
+            enabled: false
+          pingdirectory:
+            enabled: false
+          pingfederate-admin:
+            enabled: true
+          pingfederate-engine:
+            enabled: true
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success
+
+    # - name: enable load balancer on pingdirectory service
+    #   kubernetes.core.k8s:
+    #     definition:
+    #       apiVersion: v1
+    #       kind: Service
+    #       metadata:
+    #         name: pf-pingdirectory
+    #         namespace: "{{ pf_namespace.result.metadata.name }}"
+    #       spec:
+    #         type: LoadBalancer
+    #         ports:
+    #           - protocol: TCP
+    #             port: 80
+
+    - name: enable load balancer on pingfederate-admin service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: pf-pingfederate-admin
+            namespace: "{{ pf_namespace.result.metadata.name }}"
+          spec:
+            type: LoadBalancer
+            ports:
+              - protocol: TCP
+                port: 9999
+                targetPort: 9999
+
+    - name: enable load balancer on pingfederate-engine service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: pf-pingfederate-engine
+            namespace: "{{ pf_namespace.result.metadata.name }}"
+          spec:
+            type: LoadBalancer
+            ports:
+              - protocol: TCP
+                port: 9031
+                targetPort: 9031
+
+    - name: register dns and output info
+      block:
+        - name: get pf-pingfederate-admin info
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Service
+            name: pf-pingfederate-admin
+            namespace: "{{ pf_namespace.result.metadata.name }}"
+          register: pf_pingfederate_admin_info
+
+        - name: generate secure update key
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: register dns record
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: pf-admin
+            server: 10.0.3.40
+            value: "{{ (pf_pingfederate_admin_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: lab.test
+
+    - name: register dns and output info
+      block:
+        - name: get pf-pingfederate-engine info
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Service
+            name: pf-pingfederate-engine
+            namespace: "{{ pf_namespace.result.metadata.name }}"
+          register: pf_pingfederate_engine_info
+
+        - name: generate secure update key
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: register dns record
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: pf-engine
+            server: 10.0.3.40
+            value: "{{ (pf_pingfederate_engine_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: lab.test
+
+    - name: generate certificates
+      block:
+        - name: create pf-admin certificate
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: cert-manager.io/v1
+              kind: Certificate
+              metadata:
+                name: pf-admin-cert
+                namespace: default
+              spec:
+                secretName: pf-admin
+                duration: 2160h
+                renewBefore: 360h
+                commonName: pf-admin.lab.test
+                subject:
+                  organizations:
+                    - lab
+                isCA: false
+                privateKey:
+                  algorithm: RSA
+                  encoding: PKCS1
+                  size: 2048
+                dnsNames:
+                  - pf-admin.lab.test
+                ipAddresses:
+                  - "{{ (pf_pingfederate_admin_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+                usages:
+                  - server auth
+                  - client auth
+                issuerRef:
+                  name: vault-issuer
+                  kind: ClusterIssuer
+
+        - name: create pf-engine certificate
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: cert-manager.io/v1
+              kind: Certificate
+              metadata:
+                name: pf-engine-cert
+                namespace: default
+              spec:
+                secretName: pf-engine
+                duration: 2160h
+                renewBefore: 360h
+                commonName: pf-engine.lab.test
+                subject:
+                  organizations:
+                    - lab
+                isCA: false
+                privateKey:
+                  algorithm: RSA
+                  encoding: PKCS1
+                  size: 2048
+                dnsNames:
+                  - pf-engine.lab.test
+                ipAddresses:
+                  - "{{ (pf_pingfederate_engine_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+                usages:
+                  - server auth
+                  - client auth
+                issuerRef:
+                  name: vault-issuer
+                  kind: ClusterIssuer
+
+    - name: generate certificates
+      block:
+        - name: create pf certificate
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: cert-manager.io/v1
+              kind: Certificate
+              metadata:
+                name: pf-cert
+                namespace: default
+              spec:
+                secretName: pf
+                duration: 2160h
+                renewBefore: 360h
+                commonName: pf.lab.test
+                subject:
+                  organizations:
+                    - lab
+                isCA: false
+                privateKey:
+                  algorithm: RSA
+                  encoding: PKCS1
+                  size: 2048
+                dnsNames:
+                  - pf-admin.lab.test
+                  - pf-engine.lab.test
+                ipAddresses:
+                  - 10.0.3.60
+                usages:
+                  - server auth
+                  - client auth
+                issuerRef:
+                  name: vault-issuer
+                  kind: ClusterIssuer

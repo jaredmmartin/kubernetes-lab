@@ -1,0 +1,16 @@
+---
+- become: true
+  gather_facts: false
+  hosts: all
+
+  tasks:
+    - name: update all packages
+      ansible.builtin.apt:
+        autoclean: true
+        autoremove: true
+        name: "*"
+        state: latest
+
+    - name: reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 60

@@ -1,0 +1,37 @@
+---
+- become: true
+  hosts: all
+
+  tasks:
+    - name: nfs-common
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: true
+
+    - name: nfs directory
+      ansible.builtin.file:
+        group: nogroup
+        mode: 777
+        owner: nobody
+        path: /opt/share
+        state: directory
+
+    - name: nfs exports file
+      ansible.builtin.lineinfile:
+        create: true
+        group: vagrant
+        line: "/opt/share            *(rw,sync,no_root_squash,no_subtree_check,insecure)"
+        owner: vagrant
+        path: /etc/exports
+
+    - name: nfs service
+      ansible.builtin.service:
+        daemon_reload: true
+        enabled: true
+        name: nfs-kernel-server
+        state: restarted
+
+    - name: nfs exports
+      ansible.builtin.command:
+        cmd: exportfs -a

@@ -1,0 +1,82 @@
+---
+- hosts: all
+  become: true
+
+  tasks:
+    - name: initialize kubernetes cluster
+      block:
+        - name: initialize cluster
+          ansible.builtin.command: >
+            kubeadm init
+              --apiserver-advertise-address {{ ansible_facts.enp0s8.ipv4.address }}
+              --control-plane-endpoint {{ ansible_facts.enp0s8.ipv4.address }}
+              --pod-network-cidr=10.244.0.0/16
+
+        - name: create .kube directory
+          ansible.builtin.file:
+            path: /home/vagrant/.kube
+            state: directory
+
+        - name: copy kubernetes config to .kube
+          ansible.builtin.copy:
+            dest: /home/vagrant/.kube/config
+            group: vagrant
+            owner: vagrant
+            remote_src: true
+            src: /etc/kubernetes/admin.conf
+
+    - name: configure cluster networking
+      block:
+        - name: download flannel config file
+          ansible.builtin.get_url:
+            dest: ./kube-flannel.yml
+            url: https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+          register: flannel_config_file
+
+        - name: set network interface config in flannel
+          ansible.builtin.lineinfile:
+            insertafter: "        - --kube-subnet-mgr"
+            line: "        - --iface=enp0s8"
+            path: "{{ flannel_config_file.dest }}"
+
+        - name: install flannel pod network
+          kubernetes.core.k8s:
+            kubeconfig: /etc/kubernetes/admin.conf
+            src: "{{ flannel_config_file.dest }}"
+            state: present
+
+    - name: generate cluster join instructions
+      block:
+        - name: generate cluster join command
+          ansible.builtin.command: kubeadm token create --print-join-command
+          become: false
+          register: join_command
+
+        - name: create cluster join script
+          ansible.builtin.copy:
+            content: "{{ join_command.stdout }}"
+            dest: /vagrant/k8s/temp/join-cluster.sh
+
+    - name: install helm
+      block:
+        - name: download helm install script
+          ansible.builtin.get_url:
+            dest: /root/get-helm.sh
+            mode: "0700"
+            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+
+        - name: install helm
+          ansible.builtin.command: /root/get-helm.sh
+          delay: 10
+          register: helm_install
+          retries: 6
+          until: helm_install is success
+
+        - name: install helm-diff plugin
+          kubernetes.core.helm_plugin:
+            plugin_path: https://github.com/databus23/helm-diff
+            state: present
+          delay: 10
+          register: helm_diff_install
+          retries: 6
+          until: helm_diff_install is success

@@ -1,0 +1,122 @@
+---
+- hosts: all
+  become: false
+  gather_facts: false
+  tasks:
+    - name: add awx-operator repository to helm
+      kubernetes.core.helm_repository:
+        name: awx-operator
+        repo_url: https://ansible-community.github.io/awx-operator-helm/
+
+    - name: install awx-operator via helm
+      kubernetes.core.helm:
+        chart_ref: awx-operator/awx-operator
+        create_namespace: true
+        name: awx-operator
+        release_namespace: awx
+        state: present
+        update_repo_cache: true
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success
+
+    - name: create awx namespace
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: awx
+        state: present
+      register: awx_namespace
+
+    - name: create certificate
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: awx-lab-test
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          spec:
+            secretName: awx-lab-test
+            duration: 2160h
+            renewBefore: 360h
+            commonName: awx.lab.test
+            subject:
+              organizations:
+                - lab
+            isCA: false
+            privateKey:
+              algorithm: RSA
+              encoding: PKCS1
+              size: 2048
+            usages:
+              - server auth
+              - client auth
+            dnsNames:
+              - awx.lab.test
+            issuerRef:
+              name: vault-issuer
+              kind: ClusterIssuer
+
+    - name: set awx admin password secret
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: awx-admin-password
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          stringData:
+            password: vagrant
+      register: awx_admin_secret
+
+    - name: install awx service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: awx
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          spec:
+            admin_user: vagrant
+            hostname: awx.lab.test
+            ingress_api_version: "networking.k8s.io/v1"
+            ingress_class_name: nginx
+            ingress_path_type: Prefix
+            ingress_path: /
+            ingress_tls_secret: awx-lab-test
+            ingress_type: ingress
+            postgres_storage_class: nfs-client
+            projects_persistence: true
+            projects_storage_class: nfs-client
+            service_type: LoadBalancer
+        namespace: "{{ awx_namespace.result.metadata.name }}"
+
+    - name: register dns and output info
+      block:
+        - name: get awx-service info
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Service
+            name: awx-service
+            namespace: awx
+          delay: 30
+          register: awx_info
+          retries: 30
+          until: awx_info.resources[0] is defined
+
+        - name: generate secure update key
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: register dns record
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: awx
+            server: 10.0.3.40
+            value: "{{ (awx_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: lab.test

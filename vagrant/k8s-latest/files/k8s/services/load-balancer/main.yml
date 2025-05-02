@@ -1,0 +1,67 @@
+---
+- hosts: all
+  become: false
+  gather_facts: false
+  tasks:
+    - name: install metallb load balancer
+      block:
+        - name: get latest metallb release info
+          ansible.builtin.uri:
+            method: GET
+            url: https://api.github.com/repos/metallb/metallb/releases/latest
+          register: metallb_latest_release_info
+
+        - name: download nginx-ingress bare-metal
+          ansible.builtin.get_url:
+            dest: ./metallb-native.yaml
+            url: "https://raw.githubusercontent.com/metallb/metallb/{{ metallb_latest_release_info.json.tag_name }}/config/manifests/metallb-native.yaml"
+          register: metallb_config_file
+
+        - name: install metallb
+          kubernetes.core.k8s:
+            src: "{{ metallb_config_file.dest }}"
+            state: present
+
+        - name: wait for metallb pods
+          ansible.builtin.command: kubectl wait -n metallb-system --for=condition=Ready pods --selector app=metallb --timeout=600s
+
+        - name: create metallb ip pool
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: metallb.io/v1beta1
+              kind: IPAddressPool
+              metadata:
+                name: pool
+                namespace: metallb-system
+              spec:
+                addresses:
+                  - 10.0.3.50-10.0.3.70
+
+        - name: advertise metallb pool to cluster
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: metallb.io/v1beta1
+              kind: L2Advertisement
+              metadata:
+                name: pool-advert
+                namespace: metallb-system
+
+    - name: install ingress-nginx ingress controller
+      block:
+        - name: add ingress-nginx repository to helm
+          kubernetes.core.helm_repository:
+            name: ingress-nginx
+            repo_url: https://kubernetes.github.io/ingress-nginx
+
+        - name: install ingress-nginx
+          kubernetes.core.helm:
+            chart_ref: ingress-nginx/ingress-nginx
+            create_namespace: true
+            name: ingress-nginx
+            release_namespace: ingress-nginx
+            state: present
+            update_repo_cache: true
+          delay: 10
+          register: helm_install
+          retries: 6
+          until: helm_install is success

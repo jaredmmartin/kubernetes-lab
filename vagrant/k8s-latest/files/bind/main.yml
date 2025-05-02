@@ -1,0 +1,92 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    - name: install bind
+      ansible.builtin.apt:
+        name:
+          - bind9
+          - bind9utils
+          - bind9-doc
+        state: present
+        update_cache: true
+
+    - name: configure named.conf.options
+      ansible.builtin.copy:
+        content: |
+          options {
+            allow-recursion { any; };
+            allow-transfer { none; };
+            allow-query     { any; };
+            directory "/var/cache/bind";
+            dnssec-validation auto;
+            forwarders {
+              8.8.8.8;
+              8.8.4.4;
+            };
+            listen-on { any; };
+            listen-on-v6 { any; };
+            recursion yes;
+          };
+
+          logging {
+            channel syslog {
+              syslog local0;
+              severity debug;
+              print-severity yes;
+              print-category yes;
+              print-time yes;
+            };
+            category default { syslog; };
+            category queries { syslog; };
+          };
+        dest: /etc/bind/named.conf.options
+
+    - name: generate secure update key
+      ansible.builtin.set_fact:
+        dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+    - name: configure named.conf.local
+      ansible.builtin.copy:
+        content: |
+          key "dnskey" {
+            algorithm "hmac-sha256";
+            secret "{{ dnskey_secret }}";
+          };
+
+          zone lab.test. {
+              type master;
+              file "/var/lib/bind/zones/.lab.test";
+              allow-update { key dnskey; };
+          };
+        dest: /etc/bind/named.conf.local
+
+    - name: create zones directory
+      ansible.builtin.file:
+        group: bind
+        owner: bind
+        path: /var/lib/bind/zones/
+        state: directory
+
+    - name: configure zone - .lab.test
+      ansible.builtin.copy:
+        content: |
+          $TTL    600
+          @       IN      SOA     {{ ansible_hostname }}.lab.test. lab.test. (
+                          5       ; Serial
+                          604800  ; Refresh
+                          86400   ; Retry
+                          2419200 ; Expire
+                          604800 ); Negative Cache TTL
+          ;
+          ; name servers - NS records
+              IN      NS      {{ ansible_hostname }}.lab.test.
+
+          ; name servers
+          {{ ansible_hostname }}.lab.test.  IN  A 10.0.3.40
+        dest: /var/lib/bind/zones/.lab.test
+
+    - name: restart dns server
+      ansible.builtin.service:
+        name: bind9
+        state: restarted
