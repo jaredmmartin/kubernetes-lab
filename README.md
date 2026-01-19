@@ -254,8 +254,7 @@ Several services use the NFS Provisioner to provision NFS-based persistent volum
     - 4+ vCPU
     - 32+ GB RAM
     - 15+ GB available storage
-        > [!NOTE]  
-        > The VirtualBox VMs are provisioned as linked clones to conserve disk space.
+      - The VirtualBox VMs are provisioned as linked clones to conserve disk space.
   - Operating system
     - Ubuntu Linux 22.04+
   - Software
@@ -300,13 +299,15 @@ The `vagrant` directory contains the Vagrantfile to build the Kubernetes lab env
     | Variable name | Default value | Purpose |
     | ------------- | ------------- | ------- |
     | `deploy_awx` | `true` | Switch to control AWX deployment |
+    | `deploy_consul` | `true` | Switch to control Consul deployment |
     | `deploy_jenkins` | `true` | Switch to control Jenkins deployment |
     | `dns_zone` | `lab.test` | Name of DNS zone to setup for environment |
     | `gateway_ip` | `10.0.3.1` | Network gateway address |
+    | `host_adapter_bridge` | `enp12s0` | Host network adapter for bridge network |
     | `kubernetes_version` | `1.35` | Kubernetes version to deploy |
     | `load_balancer_ip_pool_range` | `10.0.3.50-10.0.3.70` | IP address range for load balancer service |
-    | `main_ip` | `10.0.3.40` | Starting IP address for VMs |
     | `num_of_workers` | `2` | Number of worker nodes to provision |
+    | `start_ip` | `10.0.3.40` | Starting IP address for VMs |
     | `subnet_cidr` | `10.0.3.0/24` | Subnet CIDR block |
 
 1. Provision the environment:
