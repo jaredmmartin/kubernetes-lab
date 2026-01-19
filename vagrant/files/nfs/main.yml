@@ -1,0 +1,53 @@
+---
+- become: true
+  gather_facts: false
+  hosts: "all"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "nfs : install nfs-kernel-server"
+      ansible.builtin.apt:
+        name: "nfs-kernel-server"
+        state: "present"
+        update_cache: true
+
+    - name: "nfs : install nfs-common"
+      ansible.builtin.apt:
+        name: "nfs-common"
+        state: "present"
+        update_cache: true
+
+    - name: "nfs : create /opt/share"
+      ansible.builtin.file:
+        group: "nogroup"
+        mode: "777"
+        owner: "nobody"
+        path: "/opt/share"
+        state: "directory"
+
+    - name: "nfs : create /etc/exports"
+      ansible.builtin.lineinfile:
+        create: true
+        group: "vagrant"
+        line: "/opt/share            *(rw,sync,no_root_squash,no_subtree_check,insecure)"
+        owner: "vagrant"
+        path: "/etc/exports"
+        state: "present"
+      notify:
+        - "nfs : restart"
+        - "nfs : exports"
+
+  handlers:
+    - name: "nfs : restart"
+      ansible.builtin.service:
+        daemon_reload: true
+        enabled: true
+        name: "nfs-kernel-server"
+        state: "restarted"
+
+    - name: "nfs : exports"
+      ansible.builtin.command:
+        cmd: "exportfs -a"

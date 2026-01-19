@@ -1,0 +1,96 @@
+---
+- become: true
+  gather_facts: true
+  hosts: "all"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "bind : install"
+      ansible.builtin.apt:
+        name:
+          - "bind9-doc"
+          - "bind9"
+          - "bind9utils"
+        state: "present"
+        update_cache: true
+
+    - name: "bind : create logs directory"
+      ansible.builtin.file:
+        group: "bind"
+        mode: "750"
+        owner: "bind"
+        path: "/var/log/named"
+        state: "directory"
+
+    - name: "bind : configure named.conf"
+      ansible.builtin.copy:
+        dest: "/etc/bind/named.conf"
+        group: "bind"
+        mode: "750"
+        owner: "bind"
+        src: "files/named.conf"
+      notify: "bind : restart server"
+
+    - name: "bind : configure named.conf.options"
+      ansible.builtin.copy:
+        dest: "/etc/bind/named.conf.options"
+        group: "bind"
+        mode: "750"
+        owner: "bind"
+        src: "files/named.conf.options"
+      notify: "bind : restart server"
+
+    - name: "bind : generate secure update key"
+      ansible.builtin.set_fact:
+        dnskey_algorithm: "hmac-sha256"
+        dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+    - name: "bind : zones"
+      block:
+        - name: "bind : zones : configure named.conf.local"
+          ansible.builtin.template:
+            dest: "/etc/bind/named.conf.local"
+            group: "bind"
+            mode: "750"
+            owner: "bind"
+            src: "templates/named.conf.local"
+          notify: "bind : restart server"
+
+        - name: "bind : zones : create zones directory"
+          ansible.builtin.file:
+            group: "bind"
+            mode: "750"
+            owner: "bind"
+            path: "/var/lib/bind/zones/"
+            state: "directory"
+          notify: "bind : restart server"
+
+        - name: "bind : zones : check zone file"
+          ansible.builtin.stat:
+            path: "/var/lib/bind/zones/{{ dns_zone }}"
+          register: zone_file
+
+        - name: "bind : zones : create zone file"
+          ansible.builtin.template:
+            dest: "/var/lib/bind/zones/{{ dns_zone }}"
+            group: "bind"
+            mode: "750"
+            owner: "bind"
+            src: "templates/zone"
+          notify: "bind : restart server"
+          when: not zone_file.stat.exists
+
+    - name: "bind : check config"
+      ansible.builtin.command:
+        cmd: "named-checkconf"
+      changed_when: false
+      register: named_checkconf
+
+  handlers:
+    - name: "bind : restart server"
+      ansible.builtin.service:
+        name: "bind9"
+        state: "restarted"

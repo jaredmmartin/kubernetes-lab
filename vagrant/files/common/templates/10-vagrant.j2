@@ -1,0 +1,14 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {{ net_interface }}:
+      addresses:
+        - {{ ansible_facts[net_interface]["ipv4"]["address"] }}/24
+      nameservers:
+        addresses:
+          - {{ dns_server_ip }}
+      routes:
+        - to: default
+          via: {{ gateway_ip }}
+          metric: 100

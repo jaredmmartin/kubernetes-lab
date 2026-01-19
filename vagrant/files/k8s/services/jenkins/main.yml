@@ -1,0 +1,85 @@
+---
+- become: false
+  hosts: "main"
+  gather_facts: false
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "jenkins : create namespace"
+      kubernetes.core.k8s:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "jenkins"
+        state: "present"
+      register: jenkins_namespace
+
+    - name: "jenkins : add repository"
+      kubernetes.core.helm_repository:
+        name: "jenkins"
+        repo_url: "https://charts.jenkins.io"
+
+    - name: "jenkins : install"
+      kubernetes.core.helm:
+        chart_ref: "jenkins/jenkins"
+        create_namespace: true
+        release_name: "jenkins"
+        release_namespace: "jenkins"
+        release_values:
+          controller:
+            serviceType: LoadBalancer
+          persistence:
+            accessMode: "ReadWriteOnce"
+            annotations: {}
+            enabled: false
+            labels: {}
+            size: "8Gi"
+            storageClass: "nfs-client"
+
+    - name: "jenkins : dns record"
+      block:
+        - name: "jenkins : dns record : get info"
+          kubernetes.core.k8s_info:
+            api_version: "v1"
+            kind: "Service"
+            name: "jenkins"
+            namespace: "jenkins"
+          delay: 30
+          register: jenkins_info
+          retries: 30
+          until: jenkins_info.resources[0] is defined
+
+        - name: "jenkins : dns record : generate secure update key"
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: "jenkins : dns record : register"
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: "jenkins"
+            server: "{{ dns_server_ip }}"
+            value: "{{ (jenkins_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: "{{ dns_zone }}"
+
+    - name: "jenkins : output"
+      block:
+        - name: "jenkins : output : set facts"
+          ansible.builtin.set_fact:
+            jenkins_config:
+              addr: "http://jenkins.{{ dns_zone }}"
+              ip: "http://{{ (jenkins_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}:8080"
+
+        - name: "jenkins : output : create temp directory"
+          ansible.builtin.file:
+            mode: "0755"
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "jenkins : output : file"
+          ansible.builtin.copy:
+            content: "{{ jenkins_config | to_nice_json }}"
+            dest: "/vagrant/k8s/temp/jenkins.json"

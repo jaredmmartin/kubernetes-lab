@@ -1,0 +1,106 @@
+---
+- become: false
+  gather_facts: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "consul : create namespace"
+      kubernetes.core.k8s:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "consul"
+        state: "present"
+      register: consul_namespace
+
+    - name: "consul : add repository"
+      kubernetes.core.helm_repository:
+        name: "hashicorp"
+        repo_url: "https://helm.releases.hashicorp.com"
+
+    - name: "consul : install"
+      kubernetes.core.helm:
+        chart_ref: "hashicorp/consul"
+        name: "consul"
+        release_namespace: "{{ consul_namespace.result.metadata.name }}"
+        state: "present"
+        update_repo_cache: true
+        values:
+          server:
+            storage: "2Gi"
+            storageClass: "nfs-client"
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success
+
+    - name: "consul : wait until vault pods are ready"
+      kubernetes.core.k8s_info:
+        api_version: "v1"
+        kind: "Pod"
+        namespace: "consul"
+      become: false
+      register: consul_pods
+      delay: 10
+      retries: 30
+      until: consul_pods | json_query('resources[*].status.phase') | unique == ["Running"]
+
+    - name: "consul : enable loadbalancer"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "v1"
+          kind: "Service"
+          metadata:
+            name: "consul-consul-ui"
+            namespace: "{{ consul_namespace.result.metadata.name }}"
+          spec:
+            type: "LoadBalancer"
+
+    - name: "consul : dns record"
+      block:
+        - name: "consul : dns record : get info"
+          kubernetes.core.k8s_info:
+            api_version: "v1"
+            kind: "Service"
+            name: "consul-consul-ui"
+            namespace: "consul"
+          delay: 30
+          register: consul_info
+          retries: 30
+          until: consul_info.resources[0] is defined
+
+        - name: "consul : dns record : generate secure update key"
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: "consul : dns record : register"
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: "consul"
+            server: "{{ dns_server_ip }}"
+            value: "{{ (consul_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: "{{ dns_zone }}"
+
+    - name: "consul : output"
+      block:
+        - name: "consul : output : set facts"
+          ansible.builtin.set_fact:
+            consul_config:
+              addr: "http://consul.{{ dns_zone }}"
+              ip: "http://{{ (consul_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+
+        - name: "consul : output : create temp directory"
+          ansible.builtin.file:
+            mode: "0755"
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "consul : output : file"
+          ansible.builtin.copy:
+            content: "{{ consul_config | to_nice_json }}"
+            dest: "/vagrant/k8s/temp/consul.json"

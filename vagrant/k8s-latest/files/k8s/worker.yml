@@ -1,7 +1,0 @@
----
-- hosts: all
-  become: true
-
-  tasks:
-    - name: join the cluster
-      ansible.builtin.shell: sh /vagrant/k8s/temp/join-cluster.sh

@@ -1,0 +1,146 @@
+---
+- become: false
+  gather_facts: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "awx : create namespace"
+      kubernetes.core.k8s:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "awx"
+        state: "present"
+      register: awx_namespace
+
+    - name: "awx : add repository"
+      kubernetes.core.helm_repository:
+        name: "awx-operator"
+        repo_url: "https://ansible-community.github.io/awx-operator-helm/"
+
+    - name: "awx: install awx-operator"
+      kubernetes.core.helm:
+        chart_ref: "awx-operator/awx-operator"
+        create_namespace: true
+        name: "awx-operator"
+        release_namespace: "awx"
+        state: "present"
+        update_repo_cache: true
+      delay: 10
+      register: helm_install
+      retries: 1
+      until: helm_install is success
+
+    - name: "awx : create certificate"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "cert-manager.io/v1"
+          kind: "Certificate"
+          metadata:
+            name: "awx"
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          spec:
+            secretName: "awx"
+            duration: "2160h"
+            renewBefore: "360h"
+            commonName: "awx.{{ dns_zone }}"
+            subject:
+              organizations:
+                - "lab"
+            isCA: false
+            privateKey:
+              algorithm: "RSA"
+              encoding: "PKCS1"
+              size: 2048
+            usages:
+              - "server auth"
+              - "client auth"
+            dnsNames:
+              - "awx.{{ dns_zone }}"
+            issuerRef:
+              name: "vault-issuer"
+              kind: "ClusterIssuer"
+
+    - name: "awx : set admin password secret"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "v1"
+          kind: "Secret"
+          metadata:
+            name: "awx-admin-password"
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          stringData:
+            password: "vagrant"
+      register: awx_admin_secret
+
+    - name: "awx : install"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "awx.ansible.com/v1beta1"
+          kind: "AWX"
+          metadata:
+            name: "awx"
+            namespace: "{{ awx_namespace.result.metadata.name }}"
+          spec:
+            admin_user: "vagrant"
+            hostname: "awx.{{ dns_zone }}"
+            ingress_api_version: "networking.k8s.io/v1"
+            ingress_class_name: "nginx"
+            ingress_path_type: "Prefix"
+            ingress_path: "/"
+            ingress_tls_secret: "awx"
+            ingress_type: "ingress"
+            postgres_storage_class: "nfs-client"
+            projects_persistence: true
+            projects_storage_class: "nfs-client"
+            service_type: "LoadBalancer"
+        namespace: "{{ awx_namespace.result.metadata.name }}"
+
+    - name: "awx : dns record"
+      block:
+        - name: "awx : dns record : get info"
+          kubernetes.core.k8s_info:
+            api_version: "v1"
+            kind: "Service"
+            name: "awx-service"
+            namespace: "awx"
+          delay: 30
+          register: awx_info
+          retries: 30
+          until: awx_info.resources[0] is defined
+
+        - name: "awx : dns record : generate secure update key"
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: "awx : dns record : register"
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: "awx"
+            server: "{{ dns_server_ip }}"
+            value: "{{ (awx_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: "{{ dns_zone }}"
+
+    - name: "awx : output"
+      block:
+        - name: "awx : output : set facts"
+          ansible.builtin.set_fact:
+            awx_config:
+              addr: "http://awx.{{ dns_zone }}"
+              ip: "{{ (awx_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+
+        - name: "awx : output : create temp directory"
+          ansible.builtin.file:
+            mode: "0755"
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "awx : output : file"
+          ansible.builtin.copy:
+            content: "{{ awx_config | to_nice_json }}"
+            dest: "/vagrant/k8s/temp/awx.json"

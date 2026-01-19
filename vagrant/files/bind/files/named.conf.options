@@ -1,0 +1,30 @@
+acl "private-network" {
+    10.0.0.0/8;
+    localhost;
+};
+
+options {
+    allow-query     { localhost; private-network; };
+    allow-recursion { localhost; private-network; };
+    allow-transfer  { none; };
+    directory "/var/cache/bind";
+    dnssec-validation auto;
+    forwarders {
+        8.8.8.8;
+        8.8.4.4;
+    };
+    listen-on { any; };
+    listen-on-v6 { any; };
+    recursion yes;
+};
+
+logging {
+    category queries { query_log; };
+    channel query_log {
+        file "/var/log/named/queries.log" versions 10 size 100m;
+        print-category yes;
+        print-severity yes;
+        print-time yes;
+        severity info;
+    };
+};

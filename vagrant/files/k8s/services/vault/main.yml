@@ -1,0 +1,528 @@
+---
+- become: false
+  gather_facts: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "vault : create namespace"
+      kubernetes.core.k8s:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "vault"
+        state: "present"
+
+    - name: "vault : add repository"
+      kubernetes.core.helm_repository:
+        name: "hashicorp"
+        repo_url: "https://helm.releases.hashicorp.com"
+
+    - name: "vault : install"
+      kubernetes.core.helm:
+        chart_ref: "hashicorp/vault"
+        create_namespace: true
+        name: "vault"
+        release_namespace: "vault"
+        state: "present"
+        update_repo_cache: true
+        values:
+          server:
+            dataStorage:
+              storageClass: "nfs-client"
+            auditStorage:
+              storageClass: "nfs-client"
+          ui:
+            enabled: true
+            serviceType: "LoadBalancer"
+            serviceNodePort: null
+            externalPort: 80
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success
+
+    - name: "vault : wait until vault pods are ready"
+      kubernetes.core.k8s_info:
+        api_version: "v1"
+        kind: "Pod"
+        namespace: "vault"
+      become: false
+      register: vault_pods
+      delay: 10
+      retries: 30
+      until: vault_pods | json_query('resources[*].status.phase') | unique == ["Running"]
+
+    - name: "vault : get status"
+      kubernetes.core.k8s_exec:
+        command: "vault status -format json"
+        namespace: "vault"
+        pod: "vault-0"
+      failed_when: vault_status.rc not in [0, 1, 2]
+      register: vault_status
+
+    - name: "vault : output status : initialized"
+      ansible.builtin.debug:
+        msg: "initialized: {{ (vault_status.stdout | from_json).initialized }}"
+
+    - name: "vault : output status : sealed"
+      ansible.builtin.debug:
+        msg: "sealed: {{ (vault_status.stdout | from_json).sealed }}"
+
+    - name: "vault : initialize"
+      kubernetes.core.k8s_exec:
+        command: "vault operator init --format json"
+        namespace: "vault"
+        pod: "vault-0"
+      register: vault_init
+      when: not (vault_status.stdout | from_json).initialized
+
+    - name: "vault  : unseal"
+      kubernetes.core.k8s_exec:
+        command: "vault operator unseal {{ item | quote }}"
+        namespace: "vault"
+        pod: "vault-0"
+      register: vault_unseal
+      loop: "{{ ((vault_init.stdout | from_json).unseal_keys_b64)[:3] }}"
+      when:
+        - (vault_status.stdout | from_json).sealed
+        - not (vault_status.stdout | from_json).initialized
+        - vault_init.changed
+
+    - name: "vault : setup"
+      when: vault_init.changed
+      block:
+        - name: "vault : setup : login"
+          kubernetes.core.k8s_exec:
+            command: "vault login {{ (vault_init.stdout | from_json).root_token }}"
+            namespace: "vault"
+            pod: "vault-0"
+
+        - name: "vault : setup : enable audit logging"
+          kubernetes.core.k8s_exec:
+            command: "vault audit enable file file_path=/vault/logs/vault_audit.log"
+            namespace: "vault"
+            pod: "vault-0"
+
+        - name: "vault : setup : enable userpass"
+          kubernetes.core.k8s_exec:
+            command: "vault auth enable userpass"
+            namespace: "vault"
+            pod: "vault-0"
+
+        - name: "vault : setup : copy policy file"
+          kubernetes.core.k8s_cp:
+            local_path: "/vagrant/k8s/services/vault/files/policy.hcl"
+            namespace: "vault"
+            pod: "vault-0"
+            remote_path: "/tmp/policy.hcl"
+            state: "to_pod"
+          become: false
+
+        - name: "vault : setup : write policy"
+          kubernetes.core.k8s_exec:
+            command: "vault policy write admin /tmp/policy.hcl"
+            namespace: "vault"
+            pod: "vault-0"
+
+        - name: "vault : setup : create user"
+          kubernetes.core.k8s_exec:
+            command: 'vault write auth/userpass/users/vagrant password="vagrant" policies="default,admin"'
+            namespace: "vault"
+            pod: "vault-0"
+
+        - name: "vault : setup : enable kv secrets engine"
+          kubernetes.core.k8s_exec:
+            command: "vault secrets enable kv"
+            namespace: "vault"
+            pod: "vault-0"
+
+    - name: "vault : dns record"
+      block:
+        - name: "vault : dns record : get info"
+          kubernetes.core.k8s_info:
+            api_version: "v1"
+            kind: "Service"
+            name: "vault-ui"
+            namespace: "vault"
+          register: vault_info
+
+        - name: "vault : dns record : generate secure update key"
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: "vault : dns record : register"
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: "vault"
+            server: "{{ dns_server_ip }}"
+            value: "{{ (vault_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: "{{ dns_zone }}"
+
+    - name: "vault : output"
+      when: vault_init.changed
+      block:
+        - name: "vault : output : set facts"
+          ansible.builtin.set_fact:
+            vault_addr: "http://vault.{{ dns_zone }}"
+            vault_config:
+              addr: "http://vault.{{ dns_zone }}"
+              init: "{{ (vault_init.stdout | from_json) }}"
+              ip: "http://{{ (vault_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+              token: "{{ (vault_init.stdout | from_json).root_token }}"
+            vault_token: "{{ (vault_init.stdout | from_json).root_token }}"
+
+        - name: "vault : output : create temp directory"
+          ansible.builtin.file:
+            mode: "0755"
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "vault : output : file"
+          ansible.builtin.copy:
+            content: "{{ vault_config | to_nice_json }}"
+            dest: "/vagrant/k8s/temp/vault.json"
+
+    - name: "vault : config"
+      block:
+        - name: "vault : get config"
+          when: (vault_status.stdout | from_json).initialized
+          block:
+            - name: "vault : get config : root token"
+              ansible.builtin.set_fact:
+                vault_token: "{{ (lookup('file', '../../temp/vault.json') | from_json).token }}"
+                vault_addr: "http://vault.{{ dns_zone }}"
+
+        - name: "vault : auth methods"
+          block:
+            - name: "vault : auth methods : list"
+              ansible.builtin.uri:
+                headers:
+                  X-Vault-Token: "{{ vault_token }}"
+                method: "GET"
+                return_content: true
+                url: "{{ vault_addr }}/v1/sys/auth"
+                status_code: 200
+              register: vault_auth_methods
+
+            - name: "vault : auth methods : set fact"
+              ansible.builtin.set_fact:
+                vault_auth_methods: "{{ vault_auth_methods.json.data.keys() | list }}"
+
+            - name: "vault : auth methods : output"
+              ansible.builtin.debug:
+                msg: "auth methods: {{ vault_auth_methods | join(', ') }}"
+
+        - name: "vault : kubernetes auth"
+          when: "'kubernetes/' not in vault_auth_methods"
+          block:
+            - name: "vault : kubernetes auth : vault-auth-reviewer"
+              block:
+                - name: "vault : kubernetes auth : vault-auth-reviewer : create service account"
+                  kubernetes.core.k8s:
+                    definition:
+                      apiVersion: "v1"
+                      kind: "ServiceAccount"
+                      metadata:
+                        name: "vault-auth-reviewer"
+                        namespace: "default"
+                    state: "present"
+
+                - name: "vault : kubernetes auth : vault-auth-reviewer : create cluster role binding"
+                  kubernetes.core.k8s:
+                    definition:
+                      apiVersion: "rbac.authorization.k8s.io/v1"
+                      kind: "ClusterRoleBinding"
+                      metadata:
+                        name: "role-tokenreview-binding"
+                        namespace: "default"
+                      roleRef:
+                        apiGroup: "rbac.authorization.k8s.io"
+                        kind: "ClusterRole"
+                        name: "system:auth-delegator"
+                      subjects:
+                        - kind: "ServiceAccount"
+                          name: "vault-auth-reviewer"
+                          namespace: "default"
+                    state: "present"
+
+                - name: "vault : kubernetes auth : vault-auth-reviewer : create secret"
+                  kubernetes.core.k8s:
+                    definition:
+                      apiVersion: "v1"
+                      kind: "Secret"
+                      metadata:
+                        name: "vault-auth-reviewer"
+                        namespace: "default"
+                        annotations:
+                          kubernetes.io/service-account.name: "vault-auth-reviewer"
+                      type: "kubernetes.io/service-account-token"
+                    state: "present"
+
+                - name: "vault : kubernetes auth : vault-auth-reviewer : get secret"
+                  kubernetes.core.k8s_info:
+                    kind: "Secret"
+                    name: "vault-auth-reviewer"
+                    namespace: "default"
+                  register: vault_auth_reviewer_secret
+
+                - name: "vault : kubernetes auth : vault-auth-reviewer : set facts"
+                  ansible.builtin.set_fact:
+                    vault_auth_reviewer_token: "{{ vault_auth_reviewer_secret.resources[0].data.token | b64decode }}"
+                    vault_auth_reviewer_ca_crt: '{{ vault_auth_reviewer_secret.resources[0].data["ca.crt"] | b64decode }}'
+
+            - name: "vault : kubernetes auth : vault-auth-user"
+              block:
+                - name: "vault : kubernetes auth : vault-auth-user : create service account"
+                  kubernetes.core.k8s:
+                    definition:
+                      apiVersion: "v1"
+                      kind: "ServiceAccount"
+                      metadata:
+                        name: "vault-auth-user"
+                        namespace: "default"
+                    state: "present"
+
+                - name: "vault : kubernetes auth : vault-auth-user : create secret"
+                  kubernetes.core.k8s:
+                    definition:
+                      apiVersion: "v1"
+                      kind: "Secret"
+                      metadata:
+                        name: "vault-auth-user"
+                        namespace: "default"
+                        annotations:
+                          kubernetes.io/service-account.name: "vault-auth-user"
+                      type: "kubernetes.io/service-account-token"
+                    state: "present"
+
+                - name: "vault : kubernetes auth : vault-auth-user : get secret"
+                  kubernetes.core.k8s_info:
+                    kind: "Secret"
+                    name: "vault-auth-user"
+                    namespace: "default"
+                  register: vault_auth_user_secret
+
+                - name: "vault : kubernetes auth : vault-auth-user : set facts"
+                  ansible.builtin.set_fact:
+                    vault_auth_user_token: "{{ vault_auth_user_secret.resources[0].data.token | b64decode }}"
+
+            - name: "vault : kubernetes auth : auth method"
+              block:
+                - name: "vault : kubernetes auth : auth method : enable"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      type: "kubernetes"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/auth/kubernetes"
+                    status_code: 204
+
+                - name: "vault : kubernetes auth : auth method : configure"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      kubernetes_host: "https://{{ control_plane_ip }}:6443"
+                      token_reviewer_jwt: "{{ vault_auth_reviewer_token | quote }}"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/auth/kubernetes/config"
+                    status_code: 204
+
+                - name: "vault : kubernetes auth : auth method : create policy"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      policy: 'path "*" {capabilities = ["create", "read", "update", "patch", "delete", "list"]}'
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/policy/kubernetes"
+                    status_code: 204
+
+                - name: "vault : kubernetes auth : auth method : create role"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      bound_service_account_names: "*"
+                      bound_service_account_namespaces: "*"
+                      token_policies: "kubernetes"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/auth/kubernetes/role/kubernetes"
+                    status_code: 200
+
+        - name: "vault : secrets engines"
+          block:
+            - name: "vault : secrets engines : list"
+              ansible.builtin.uri:
+                headers:
+                  X-Vault-Token: "{{ vault_token }}"
+                method: "GET"
+                return_content: true
+                url: "{{ vault_addr }}/v1/sys/mounts"
+                status_code: 200
+              register: vault_secrets_engines
+
+            - name: "vault : secrets engines : set fact"
+              ansible.builtin.set_fact:
+                vault_secrets_engines: "{{ vault_secrets_engines.json.data.keys() | list }}"
+
+            - name: "vault : secrets engines : output"
+              ansible.builtin.debug:
+                msg: "secrets engines: {{ vault_secrets_engines | join(', ') }}"
+
+        - name: "vault : pki"
+          block:
+            - name: "vault : pki : pki_root"
+              when: "'pki_root/' not in vault_secrets_engines"
+              block:
+                - name: "vault : pki : pki_root : enable"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      type: "pki"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/mounts/pki_root"
+                    status_code: 204
+
+                - name: "vault : pki : pki_root : tune"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      max_lease_ttl: "87600h"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/mounts/pki_root/tune"
+                    status_code: 204
+
+                - name: "vault : pki : pki_root : generate"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      common_name: "{{ dns_zone }}"
+                      issuer_name: "root"
+                      ttl: "87600h"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/pki_root/root/generate/internal"
+                  register: pki_root_cert
+
+                - name: "vault : pki : pki_root : create role"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      allow_any_name: true
+                      issuer_ref: "root"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                      X-Vault-Request: true
+                    method: "PUT"
+                    url: "{{ vault_addr }}/v1/pki_root/roles/servers"
+
+                - name: "vault : pki : pki_root : set urls"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      issuing_certificates: "{{ vault_addr }}/v1/pki_root/ca"
+                      crl_distribution_points: "{{ vault_addr }}/v1/pki_root/crl"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/pki_root/config/urls"
+                  register: pki_root_cert
+
+            - name: "vault : pki : pki_int"
+              when: "'pki_int/' not in vault_secrets_engines"
+              block:
+                - name: "vault : pki : pki_int : enable"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      type: "pki"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/mounts/pki_int"
+                    status_code: 204
+
+                - name: "vault : pki : pki_int : tune"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      max_lease_ttl: "87600h"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/sys/mounts/pki_int/tune"
+                    status_code: 204
+
+                - name: "vault : pki : pki_int : generate csr"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      common_name: "{{ dns_zone }} intermediate authority"
+                      issuer_name: "{{ dns_zone | replace('.', '-') }}-intermediate-authority"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/pki_int/intermediate/generate/internal"
+                  register: pki_int_csr
+
+                - name: "vault : pki : pki_int : sign csr"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      csr: "{{ pki_int_csr.json.data.csr }}"
+                      format: "pem_bundle"
+                      ttl: "43800h"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "POST"
+                    url: "{{ vault_addr }}/v1/pki_root/root/sign-intermediate"
+                  register: pki_int_pem
+
+                - name: "vault : pki : pki_int : import"
+                  ansible.builtin.uri:
+                    body_format: json
+                    body:
+                      certificate: "{{ pki_int_pem.json.data.certificate }}"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: POST
+                    url: "{{ vault_addr }}/v1/pki_int/intermediate/set-signed"
+
+            - name: "vault : pki : issuer"
+              block:
+                - name: "vault : pki : issuer : get default"
+                  ansible.builtin.uri:
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: "GET"
+                    url: "{{ vault_addr }}/v1/pki_int/config/issuers"
+                  register: pki_int_issuers_info
+
+                - name: "vault : pki : issuer : create"
+                  ansible.builtin.uri:
+                    body_format: "json"
+                    body:
+                      allow_subdomains: true
+                      allowed_domains: "{{ dns_zone }}"
+                      issuer_ref: "{{ pki_int_issuers_info.json.data.default }}"
+                      max_ttl: "720h"
+                    headers:
+                      X-Vault-Token: "{{ vault_token }}"
+                    method: POST
+                    url: "{{ vault_addr }}/v1/pki_int/roles/lab-test"

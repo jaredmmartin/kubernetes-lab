@@ -1,0 +1,100 @@
+---
+- become: true
+  gather_facts: true
+  hosts: "all"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "os : packages"
+      block:
+        - name: "os : packages : update"
+          ansible.builtin.apt:
+            autoclean: true
+            autoremove: true
+            name: "*"
+            state: latest
+
+        - name: "os : packages : curl and pip"
+          ansible.builtin.apt:
+            name:
+              - "curl"
+              - "pip"
+            state: "present"
+            update_cache: true
+
+    - name: "os : networking"
+      block:
+        - name: "os : networking : get primary network interface"
+          ansible.builtin.set_fact:
+            net_interface: >-
+              {{
+                ansible_facts.interfaces
+                | reject('equalto', 'lo')
+                | map('extract', ansible_facts)
+                | selectattr('ipv4', 'defined')
+                | selectattr('ipv4.address', 'defined')
+                | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.0.2.0/24')
+                | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.244.0.0/24')
+                | map(attribute='device')
+                | first
+                | default(omit)
+              }}
+
+        - name: "os : networking : output primary network interface"
+          ansible.builtin.debug:
+            msg: "primary network interface: {{ net_interface }} ({{ ansible_facts[net_interface]['ipv4']['address'] | default('No IP') }})"
+
+        - name: "os : networking : netplan file"
+          ansible.builtin.template:
+            dest: "/etc/netplan/10-vagrant.yaml"
+            group: "root"
+            mode: "0600"
+            owner: "root"
+            src: "templates/10-vagrant.j2"
+          register: netplan_update
+
+        - name: "os : networking : apply"
+          ansible.builtin.shell:
+            cmd: "netplan apply"
+          when: netplan_update.changed
+
+    - name: "os : disable swap"
+      block:
+        - name: "os : disable swap : remove swapfile from /etc/fstab"
+          ansible.posix.mount:
+            fstype: "swap"
+            name: "{{ item }}"
+            state: "absent"
+          loop:
+            - "none"
+            - "swap"
+
+        - name: "os : disable swap : disable now"
+          ansible.builtin.command:
+            cmd: "swapoff -a"
+          changed_when: false
+
+    - name: "os : kernel"
+      block:
+        - name: "os : kernel : add modules"
+          community.general.modprobe:
+            name: "{{ item }}"
+            state: "present"
+          loop:
+            - "br_netfilter"
+            - "overlay"
+
+        - name: "os : kernel : sysctl parameters"
+          ansible.posix.sysctl:
+            name: "{{ item }}"
+            reload: true
+            state: "present"
+            sysctl_file: "/etc/sysctl.d/kubernetes.conf"
+            value: "1"
+          loop:
+            - "net.bridge.bridge-nf-call-ip6tables"
+            - "net.bridge.bridge-nf-call-iptables"
+            - "net.ipv4.ip_forward"

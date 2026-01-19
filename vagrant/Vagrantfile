@@ -1,0 +1,263 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+require 'yaml'
+
+# Load the settings file
+settings = YAML.load_file 'settings.yml'
+
+Vagrant.configure("2") do |config|
+  # Set default VM configuration
+  config.ssh.password = "vagrant"
+  config.ssh.username = "vagrant"
+  config.vm.box = "../packer/ubuntu-server-24.04/ubuntu-server-24.04.box"
+  config.vm.box_check_update = true
+  config.vm.synced_folder "./files/", "/vagrant"
+
+  # Main cluster node
+  config.vm.define "main" do |main|
+    # Set VM name
+    main.vm.hostname = "k8s-main"
+
+    # Set network address
+    main.vm.network "public_network", bridge: "enp12s0", ip: settings['main_ip'].to_s
+
+    # Configure VM
+    main.vm.provider "virtualbox" do |v|
+      v.cpus = 2
+      v.default_nic_type = "virtio"
+      v.gui = false
+      v.linked_clone = true
+      v.memory = 4096
+      v.name = "k8s-main"
+    end
+
+    # Configure OS
+    main.vm.provision "ansible" do |ansible|
+      ansible.compatibility_mode = "2.0"
+      ansible.extra_vars = {
+        dns_server_ip: settings['main_ip'].to_s,
+        gateway_ip: settings['gateway_ip'].to_s
+      }
+      ansible.playbook = "files/common/main.yml"
+    end
+
+    # Configure DNS server
+    main.vm.provision "ansible" do |ansible|
+      ansible.compatibility_mode = "2.0"
+      ansible.extra_vars = {
+        dns_server_ip: settings['main_ip'].to_s,
+        dns_zone: settings['dns_zone']
+      }
+      ansible.playbook = "files/bind/main.yml"
+    end
+
+    # Configure NFS server
+    main.vm.provision "ansible" do |ansible|
+      ansible.compatibility_mode = "2.0"
+      ansible.playbook = "files/nfs/main.yml"
+    end
+
+    # Configure common cluster components
+    main.vm.provision "ansible" do |ansible|
+      ansible.compatibility_mode = "2.0"
+      ansible.extra_vars = {
+        dns_server_ip: settings['main_ip'].to_s,
+        dns_zone: settings['dns_zone'],
+        kubernetes_version: settings['kubernetes_version']
+      }
+      ansible.playbook = "files/k8s/common.yml"
+    end
+
+    # Configure main cluster node
+    main.vm.provision "ansible" do |ansible|
+      ansible.compatibility_mode = "2.0"
+      ansible.playbook = "files/k8s/main.yml"
+    end
+
+    # Remove the cluster join script after destroy
+    main.trigger.after :destroy do |trigger|
+      trigger.info = "Removing cluster temp files..."
+      trigger.run = {inline: "bash -c 'rm -rf ./files/k8s/temp/*'"}
+    end
+
+    # Output VM info
+    main.vm.post_up_message = <<~MSG
+      🚀 control plane vm is up
+      ℹ️  name: k8s-main
+      ℹ️  ip: #{settings['main_ip'].to_s}
+    MSG
+  end
+
+  # Set the starting IP for worker nodes
+  worker_ip = settings['main_ip'].succ
+
+  # Set the number of worker nodes
+  NUM_OF_WORKERS = settings['num_of_workers']
+
+  # Worker nodes
+  (1..NUM_OF_WORKERS).each do |i|
+    config.vm.define "worker0#{i}" do |worker|
+      # Set VM name
+      worker.vm.hostname = "k8s-worker0#{i}"
+
+      # Set network address
+      worker.vm.network "public_network", bridge: "enp12s0", ip: worker_ip.to_s
+
+      # Configure VM
+      worker.vm.provider "virtualbox" do |v|
+        v.cpus = 2
+        v.gui = false
+        v.linked_clone = true
+        v.memory = 4096
+        v.name = "k8s-worker0#{i}"
+      end
+
+      # Configure OS
+      worker.vm.provision "ansible" do |ansible|
+        ansible.compatibility_mode = "2.0"
+        ansible.extra_vars = {
+          gateway_ip: settings['gateway_ip'].to_s,
+          dns_server_ip: settings['main_ip'].to_s
+        }
+        ansible.playbook = "files/common/main.yml"
+      end
+
+      # Configure common cluster components
+      worker.vm.provision "ansible" do |ansible|
+        ansible.compatibility_mode = "2.0"
+        ansible.extra_vars = {
+          dns_server_ip: settings['main_ip'].to_s,
+          dns_zone: settings['dns_zone'],
+          kubernetes_version: settings['kubernetes_version']
+        }
+        ansible.playbook = "files/k8s/common.yml"
+      end
+
+      # Join the cluster
+      worker.vm.provision "ansible" do |ansible|
+        ansible.compatibility_mode = "2.0"
+        ansible.playbook = "files/k8s/worker.yml"
+      end
+
+      # Output VM info
+      worker.vm.post_up_message = <<~MSG
+        🚀 worker node vm is up
+        ℹ️  name: k8s-worker0#{i}
+        ℹ️  ip: #{worker_ip.to_s}
+      MSG
+
+      # If this is the last worker node, deploy required cluster components
+      if i == NUM_OF_WORKERS
+        # Setup Nginx ingress controller and MetalLB load balancer
+        worker.vm.provision "ansible" do |ansible|
+          ansible.compatibility_mode = "2.0"
+          ansible.extra_vars = {
+            ip_pool: settings['load_balancer_ip_pool_range'].to_s,
+          }
+          ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+          ansible.limit = 'all'
+          ansible.playbook = "files/k8s/services/load-balancer/main.yml"
+        end
+
+        # Setup Kubernetes dashboard
+        worker.vm.provision "ansible" do |ansible|
+          ansible.compatibility_mode = "2.0"
+          ansible.extra_vars = {
+            dns_server_ip: settings['main_ip'].to_s,
+            dns_zone: settings['dns_zone']
+          }
+          ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+          ansible.limit = 'all'
+          ansible.playbook = "files/k8s/services/dashboard/main.yml"
+        end
+
+        # Setup NFS provisioner
+        worker.vm.provision "ansible" do |ansible|
+          ansible.compatibility_mode = "2.0"
+          ansible.extra_vars = {
+            nfs_server_ip: settings['main_ip'].to_s
+          }
+          ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+          ansible.limit = 'all'
+          ansible.playbook = "files/k8s/services/nfs-provisioner/main.yml"
+        end
+
+        # Setup Hashicorp Vault
+        worker.vm.provision "ansible" do |ansible|
+          ansible.compatibility_mode = "2.0"
+          ansible.extra_vars = {
+            control_plane_ip: settings['main_ip'].to_s,
+            dns_server_ip: settings['main_ip'].to_s,
+            dns_zone: settings['dns_zone']
+          }
+          ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+          ansible.limit = 'all'
+          ansible.playbook = "files/k8s/services/vault/main.yml"
+        end
+
+        # Setup cert-manager
+        worker.vm.provision "ansible" do |ansible|
+          ansible.compatibility_mode = "2.0"
+          ansible.extra_vars = {
+            dns_zone: settings['dns_zone']
+          }
+          ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+          ansible.limit = 'all'
+          ansible.playbook = "files/k8s/services/cert-manager/main.yml"
+        end
+      end
+
+      # If this is the last worker node, deploy optional services
+      if i == NUM_OF_WORKERS
+        # If the DEPLOY_AWX variable is true, deploy AWX to the cluster
+        if settings['deploy_awx']
+          # Setup AWX
+          worker.vm.provision "ansible" do |ansible|
+            ansible.compatibility_mode = "2.0"
+            ansible.extra_vars = {
+              control_plane_ip: settings['main_ip'].to_s,
+              dns_server_ip: settings['main_ip'].to_s,
+              dns_zone: settings['dns_zone']
+            }
+            ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+            ansible.limit = 'all'
+            ansible.playbook = "files/k8s/services/awx/main.yml"
+          end
+        end
+
+        # If the DEPLOY_CONSUL variable is true, deploy Consul to the cluster
+        if settings['deploy_consul']
+          # Setup Consul
+          worker.vm.provision "ansible" do |ansible|
+            ansible.compatibility_mode = "2.0"
+            ansible.extra_vars = {
+              dns_server_ip: settings['main_ip'].to_s,
+              dns_zone: settings['dns_zone']
+            }
+            ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+            ansible.limit = 'all'
+            ansible.playbook = "files/k8s/services/consul/main.yml"
+          end
+        end
+
+        # If the DEPLOY_JENKINS variable is true, deploy AWX to the cluster
+        if settings['deploy_jenkins']
+          # Setup Jenkins
+          worker.vm.provision "ansible" do |ansible|
+            ansible.compatibility_mode = "2.0"
+            ansible.extra_vars = {
+              dns_server_ip: settings['main_ip'].to_s,
+              dns_zone: settings['dns_zone']
+            }
+            ansible.inventory_path = ".vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory"
+            ansible.limit = 'all'
+            ansible.playbook = "files/k8s/services/jenkins/main.yml"
+          end
+        end
+      end
+
+      # Increment the worker node IP address
+      worker_ip = worker_ip.succ
+    end
+  end
+end

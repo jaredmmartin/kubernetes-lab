@@ -1,0 +1,89 @@
+---
+- become: true
+  gather_facts: false
+  hosts: "all"
+
+  tasks:
+    - name: "packages"
+      block:
+        - name: "packages : update"
+          ansible.builtin.apt:
+            autoclean: true
+            autoremove: true
+            name: "*"
+            state: "latest"
+
+        - name: "packages : install"
+          ansible.builtin.apt:
+            name:
+              - "ca-certificates"
+              - "chrony"
+              - "curl"
+              - "git"
+            state: "present"
+
+    - name: "set timezone"
+      ansible.builtin.command:
+        cmd: "timedatectl set-timezone UTC"
+      changed_when: false
+
+    - name: "cleanup"
+      block:
+        - name: "cleanup : welcome prompt"
+          ansible.builtin.apt:
+            name: "gnome-initial-setup"
+            purge: true
+            state: "absent"
+
+        - name: "cleanup : incomplete language support notifications : find incomplete* files"
+          ansible.builtin.find:
+            paths: "/var/lib/update-notifier/user.d/"
+            patterns: "incomplete*"
+            recurse: true
+          register: incomplete_files
+
+        - name: "cleanup : incomplete language support notifications : delete"
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: "absent"
+          loop: "{{ incomplete_files.files }}"
+          when: incomplete_files.matched > 0
+
+        - name: "cleanup : apt"
+          ansible.builtin.apt:
+            autoclean: true
+            autoremove: true
+
+        - name: "cleanup : apt lists"
+          ansible.builtin.file:
+            path: "/var/lib/apt/lists/"
+            state: "absent"
+
+        - name: "cleanup : cloud-init state"
+          ansible.builtin.command:
+            cmd: "cloud-init clean --logs"
+
+        - name: "cleanup :  machine-id"
+          ansible.builtin.command:
+            cmd: "truncate -s 0 /etc/machine-id"
+
+        - name: "cleanup : dbus machine-id"
+          ansible.builtin.file:
+            path: "/var/lib/dbus/machine-id"
+            state: "absent"
+
+        - name: "cleanup : recreate apt lists directory"
+          ansible.builtin.file:
+            group: "root"
+            mode: "0755"
+            owner: "root"
+            path: "/var/lib/apt/lists/"
+            state: "directory"
+
+        - name: "cleanup : temp directories"
+          ansible.builtin.command:
+            cmd: "rm -rf /tmp/* /var/tmp/*"
+
+    - name: "reboot"
+      ansible.builtin.reboot:
+        reboot_timeout: 60

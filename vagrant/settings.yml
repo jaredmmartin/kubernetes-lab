@@ -1,0 +1,32 @@
+---
+# Switch to deploy AWX
+deploy_awx: true
+
+# Switch to deploy Consul
+deploy_consul: true
+
+# Switch to deploy Jenkins
+deploy_jenkins: true
+
+# DNS zone
+dns_zone: "lab.test"
+
+# Gateway IP address
+gateway_ip: 10.0.3.1
+
+# Kubernetes version to deploy
+kubernetes_version: "1.35"
+
+# IP address range for the load balancer service. IP addresses in this range
+# will be assigned to services of type LoadBalancer.
+load_balancer_ip_pool_range: "10.0.3.50-10.0.3.70"
+
+# Start IP address. The first IP will be assigned to the main node and the IP
+# will be incremented for each worker node.
+main_ip: 10.0.3.40
+
+# Number of worker nodes to provision
+num_of_workers: 2
+
+# Subnet CIDR
+subnet_cidr: 10.0.3.0/24

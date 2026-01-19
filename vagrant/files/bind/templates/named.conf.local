@@ -1,0 +1,10 @@
+key "dnskey" {
+  algorithm "{{ dnskey_algorithm }}";
+  secret "{{ dnskey_secret }}";
+};
+
+zone {{ dns_zone }}. {
+    type master;
+    file "/var/lib/bind/zones/{{ dns_zone }}";
+    allow-update { key dnskey; };
+};

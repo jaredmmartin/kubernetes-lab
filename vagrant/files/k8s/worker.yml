@@ -1,0 +1,35 @@
+---
+- become: true
+  hosts: "all"
+  gather_facts: true
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/worker.yml on {{ inventory_hostname }}"
+
+    - name: "k8s worker : check kubelet.conf"
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/kubelet.conf"
+      register: kubelet_conf
+
+    - name: "k8s : worker : set system environment variable"
+      ansible.builtin.lineinfile:
+        create: true
+        line: 'KUBECONFIG="/etc/kubernetes/kubelet.conf"'
+        path: "/etc/environment"
+        state: "present"
+      when: kubelet_conf.stat.exists
+
+    - name: "k8s worker : check if joined to cluster"
+      ansible.builtin.shell:
+        cmd: "kubectl describe node k8s-{{ inventory_hostname }}"
+      changed_when: false
+      failed_when: describe_node_output.rc not in [0, 1]
+      register: describe_node_output
+      when: kubelet_conf.stat.exists
+
+    - name: "k8s worker : join cluster"
+      ansible.builtin.shell:
+        cmd: "sh /vagrant/k8s/temp/join-cluster.sh"
+      when: not kubelet_conf.stat.exists or (describe_node_output is defined and describe_node_output.rc != 0)

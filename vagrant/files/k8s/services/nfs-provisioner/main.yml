@@ -1,0 +1,36 @@
+---
+- become: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "nfs provisioner : add repository"
+      kubernetes.core.helm_repository:
+        name: "nfs-subdir-external-provisioner"
+        repo_url: "https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/"
+
+    - name: "nfs provisioner : create namespace"
+      kubernetes.core.k8s:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "nfs-provisioner"
+        state: "present"
+
+    - name: "nfs provisioner : install"
+      kubernetes.core.helm:
+        chart_ref: "nfs-subdir-external-provisioner/nfs-subdir-external-provisioner"
+        name: "nfs-provisioner"
+        release_namespace: "nfs-provisioner"
+        state: "present"
+        update_repo_cache: true
+        values:
+          nfs:
+            server: "{{ nfs_server_ip }}"
+            path: "/opt/share"
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success

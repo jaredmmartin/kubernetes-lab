@@ -1,0 +1,90 @@
+---
+- become: false
+  gather_facts: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "load balanccer : check if metallb is installed"
+      kubernetes.core.k8s_info:
+        kind: "Namespace"
+        name: "metallb-system"
+      register: metallb_namespace_info
+      failed_when: false
+
+    - name: "load balancer : metallb"
+      when: metallb_namespace_info is not defined or metallb_namespace_info.resources is not defined or metallb_namespace_info.resources | length == 0
+      block:
+        - name: "load balancer : metallb : get latest release"
+          ansible.builtin.uri:
+            method: "GET"
+            url: "https://api.github.com/repos/metallb/metallb/releases/latest"
+          register: metallb_latest_release_info
+
+        - name: "load balancer : metallb : download nginx-ingress bare-metal"
+          ansible.builtin.get_url:
+            dest: "./metallb-native.yaml"
+            url: "https://raw.githubusercontent.com/metallb/metallb/{{ metallb_latest_release_info.json.tag_name }}/config/manifests/metallb-native.yaml"
+          register: metallb_config_file
+
+        - name: "load balancer : metallb : install"
+          kubernetes.core.k8s:
+            src: "{{ metallb_config_file.dest }}"
+            state: "present"
+
+        - name: "load balancer : metallb : wait for pods"
+          ansible.builtin.command:
+            cmd: "kubectl wait -n metallb-system --for=condition=Ready pods --selector app=metallb --timeout=600s"
+
+        - name: "load balancer : metallb : create ip address pool"
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: "metallb.io/v1beta1"
+              kind: "IPAddressPool"
+              metadata:
+                name: "pool"
+                namespace: "metallb-system"
+              spec:
+                addresses:
+                  - "{{ ip_pool }}"
+
+        - name: "load balancer : metallb : advertise ip address pool to cluster"
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: "metallb.io/v1beta1"
+              kind: "L2Advertisement"
+              metadata:
+                name: "pool-advert"
+                namespace: "metallb-system"
+
+    - name: "load balancer : check if nginx ingress controller is installed"
+      kubernetes.core.k8s_info:
+        kind: "Deployment"
+        name: "ingress-nginx-controller"
+        namespace: "ingress-nginx"
+      register: nginx_ingress_deployment_info
+      failed_when: false
+
+    - name: "load balancer : metallb : nginx ingress controller"
+      when: nginx_ingress_deployment_info is not defined or nginx_ingress_deployment_info.resources is not defined or nginx_ingress_deployment_info.resources | length == 0
+      block:
+        - name: "load balancer : metallb : nginx ingress controller : add repository"
+          kubernetes.core.helm_repository:
+            name: "ingress-nginx"
+            repo_url: "https://kubernetes.github.io/ingress-nginx"
+
+        - name: "load balancer : metallb : nginx ingress controller : install"
+          kubernetes.core.helm:
+            chart_ref: "ingress-nginx/ingress-nginx"
+            create_namespace: true
+            name: "ingress-nginx"
+            release_namespace: "ingress-nginx"
+            state: "present"
+            update_repo_cache: true
+          delay: 10
+          register: helm_install
+          retries: 6
+          until: helm_install is success

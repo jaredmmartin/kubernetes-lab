@@ -1,0 +1,150 @@
+---
+- become: true
+  hosts: "all"
+  gather_facts: true
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/common.yml on {{ inventory_hostname }}"
+
+    - name: "k8s prerequisites"
+      block:
+        - name: "k8s prerequisites : dns"
+          block:
+            - name: "k8s prerequisites : dns : get primary network interface"
+              ansible.builtin.set_fact:
+                net_interface: >-
+                  {{
+                    ansible_facts.interfaces
+                    | reject('equalto', 'lo')
+                    | map('extract', ansible_facts)
+                    | selectattr('ipv4', 'defined')
+                    | selectattr('ipv4.address', 'defined')
+                    | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.0.2.0/24')
+                    | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.244.0.0/24')
+                    | map(attribute='device')
+                    | first
+                    | default(omit)
+                  }}
+
+            - name: "k8s prerequisites : dns : output primary network interface"
+              ansible.builtin.debug:
+                msg: "primary network interface: {{ net_interface }} ({{ ansible_facts[net_interface]['ipv4']['address'] | default('No IP') }})"
+
+            - name: "k8s prerequisites : dns : install packages"
+              ansible.builtin.apt:
+                autoclean: true
+                autoremove: true
+                name:
+                  - "python3-dnspython"
+                  - "python3-passlib"
+                state: "present"
+
+            - name: "k8s prerequisites : dns : generate secure update key"
+              ansible.builtin.set_fact:
+                dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+            - name: "k8s prerequisites : dns : register dns record"
+              community.general.nsupdate:
+                key_algorithm: "hmac-sha256"
+                key_name: "dnskey"
+                key_secret: "{{ dnskey_secret }}"
+                record: "{{ ansible_hostname }}"
+                server: "{{ dns_server_ip }}"
+                value: "{{ ansible_facts[net_interface]['ipv4']['address'] }}"
+                zone: "{{ dns_zone }}"
+
+        - name: "k8s prerequisites : install python kubernetes module"
+          ansible.builtin.apt:
+            autoclean: true
+            autoremove: true
+            name: "python3-kubernetes"
+            state: "present"
+
+        - name: "k8s prerequisites : containerd"
+          block:
+            - name: "k8s prerequisites : containerd : docker repository key"
+              ansible.builtin.apt_key:
+                url: "https://download.docker.com/linux/ubuntu/gpg"
+                state: "present"
+
+            - name: "k8s prerequisites : containerd : docker repository"
+              ansible.builtin.apt_repository:
+                filename: "docker"
+                repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+                state: "present"
+
+            - name: "k8s prerequisites : containerd : install"
+              ansible.builtin.apt:
+                name: "containerd.io"
+                state: "present"
+                update_cache: true
+
+            - name: "k8s prerequisites : containerd : check config.toml"
+              ansible.builtin.stat:
+                path: "/etc/containerd/config.toml"
+              register: config_file
+
+            - name: "k8s prerequisites : containerd : create config.toml if missing"
+              ansible.builtin.shell:
+                cmd: "containerd config default | sudo tee /etc/containerd/config.toml"
+              notify: "k8s : containerd : restart"
+              when: not config_file.stat.exists
+
+            - name: "k8s prerequisites : containerd : enable cri plugin"
+              ansible.builtin.replace:
+                path: "/etc/containerd/config.toml"
+                regexp: '^disabled_plugins\s=\s\["cri"\]$'
+                replace: '#disabled_plugins = ["cri"]'
+
+            - name: "k8s prerequisites : containerd : use systemd cgroup"
+              ansible.builtin.lineinfile:
+                line: "    SystemdCgroup = true"
+                path: "/etc/containerd/config.toml"
+                regexp: '\s+SystemdCgroup\s=\sfalse'
+              notify: "k8s : containerd : restart"
+
+    - name: "k8s"
+      block:
+        - name: "k8s : create /var/lib/kubelet"
+          ansible.builtin.file:
+            path: "/var/lib/kubelet"
+            state: "directory"
+
+        - name: "k8s : add hosts file entries"
+          ansible.builtin.lineinfile:
+            create: true
+            line: 'KUBELET_KUBEADM_ARGS="--container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock"'
+            path: "/var/lib/kubelet/kubeadm-flags.env"
+
+        - name: "k8s : kubernetes repository key"
+          ansible.builtin.apt_key:
+            state: "present"
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+
+        - name: "k8s : kubernetes repository"
+          ansible.builtin.apt_repository:
+            filename: "docker"
+            repo: "deb https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+            state: "present"
+
+        - name: "k8s : install"
+          ansible.builtin.apt:
+            name:
+              - "kubeadm"
+              - "kubectl"
+              - "kubelet"
+            state: "present"
+            update_cache: true
+
+        - name: "k8s : hold package versions"
+          ansible.builtin.shell:
+            cmd: "apt-mark hold kubeadm kubelet kubectl"
+          changed_when: false
+
+  handlers:
+    - name: "k8s : containerd : restart"
+      ansible.builtin.service:
+        name: "containerd"
+        state: "restarted"

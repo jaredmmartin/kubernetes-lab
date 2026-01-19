@@ -1,0 +1,122 @@
+---
+- become: false
+  hosts: "main"
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "dashboard : add kubernetes-dashboard repository to helm"
+      kubernetes.core.helm_repository:
+        name: "kubernetes-dashboard"
+        repo_url: "https://kubernetes.github.io/dashboard/"
+
+    - name: "dashboard : install"
+      kubernetes.core.helm:
+        chart_ref: "kubernetes-dashboard/kubernetes-dashboard"
+        create_namespace: true
+        name: "kubernetes-dashboard"
+        release_namespace: "kubernetes-dashboard"
+        state: "present"
+        update_repo_cache: true
+        values:
+          extraArgs:
+            - "--token-ttl=86400"
+          kong:
+            enabled: true
+            proxy:
+              type: NodePort
+              nodePort: 32260
+              http:
+                enabled: false
+      delay: 10
+      register: helm_install
+      retries: 6
+      until: helm_install is success
+
+    - name: "dashboard : enable loadbalancer"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "v1"
+          kind: "Service"
+          metadata:
+            name: "kubernetes-dashboard-kong-proxy"
+            namespace: "kubernetes-dashboard"
+          spec:
+            type: "LoadBalancer"
+
+    - name: "dashboard : create admin-user service acccount"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "v1"
+          kind: "ServiceAccount"
+          metadata:
+            name: "admin-user"
+            namespace: "kubernetes-dashboard"
+
+    - name: "dashboard : create admin-user role binding"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: "rbac.authorization.k8s.io/v1"
+          kind: "ClusterRoleBinding"
+          metadata:
+            name: "admin-user"
+          roleRef:
+            apiGroup: "rbac.authorization.k8s.io"
+            kind: "ClusterRole"
+            name: "cluster-admin"
+          subjects:
+            - kind: "ServiceAccount"
+              name: "admin-user"
+              namespace: "kubernetes-dashboard"
+
+    - name: "dashboard : get info"
+      kubernetes.core.k8s_info:
+        api_version: "v1"
+        kind: "Service"
+        name: "kubernetes-dashboard-kong-proxy"
+        namespace: "kubernetes-dashboard"
+      register: kubernetes_dashboard_info
+
+    - name: "dashboard : dns record"
+      block:
+        - name: "dashboard : dns record : generate secure update key"
+          ansible.builtin.set_fact:
+            dnskey_secret: "{{ 'vagrant' | password_hash(hashtype='sha256',salt='vagrant') | b64encode }}"
+
+        - name: "dashboard : dns record : register"
+          community.general.nsupdate:
+            key_algorithm: "hmac-sha256"
+            key_name: "dnskey"
+            key_secret: "{{ dnskey_secret }}"
+            record: "dashboard"
+            server: "{{ dns_server_ip }}"
+            value: "{{ (kubernetes_dashboard_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+            zone: "{{ dns_zone }}"
+
+    - name: "dashboard : create admin-user token"
+      ansible.builtin.shell:
+        cmd: "kubectl -n kubernetes-dashboard create token admin-user --duration=488h"
+      changed_when: false
+      register: kubectl_create_token
+
+    - name: "dashboard : output"
+      block:
+        - name: "dashboard : output : set facts"
+          ansible.builtin.set_fact:
+            dashboard_config:
+              ip: "{{ 'https://' + (kubernetes_dashboard_info.resources[0].status.loadBalancer.ingress[0].ip | string) }}"
+              addr: "http://dashboard.{{ dns_zone }}"
+              token: "{{ kubectl_create_token.stdout }}"
+
+        - name: "dashboard : output : create temp directory"
+          ansible.builtin.file:
+            mode: "0755"
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "dashboard : output : file"
+          ansible.builtin.copy:
+            content: "{{ dashboard_config | to_nice_json }}"
+            dest: "/vagrant/k8s/temp/dashboard.json"

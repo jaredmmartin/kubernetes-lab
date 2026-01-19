@@ -1,0 +1,143 @@
+---
+- become: true
+  hosts: "all"
+  gather_facts: true
+
+  tasks:
+    - name: "playbook info"
+      ansible.builtin.debug:
+        msg: "running {{ playbook_dir }}/main.yml on {{ inventory_hostname }}"
+
+    - name: "k8s main : get primary network interface"
+      ansible.builtin.set_fact:
+        net_interface: >-
+          {{
+            ansible_facts.interfaces
+            | reject('equalto', 'lo')
+            | map('extract', ansible_facts)
+            | selectattr('ipv4', 'defined')
+            | selectattr('ipv4.address', 'defined')
+            | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.0.2.0/24')
+            | rejectattr('ipv4.address', 'ansible.utils.in_network', '10.244.0.0/24')
+            | map(attribute='device')
+            | first
+            | default(omit)
+          }}
+
+    - name: "k8s main : output primary network interface"
+      ansible.builtin.debug:
+        msg: "primary network interface: {{ net_interface }} ({{ ansible_facts[net_interface]['ipv4']['address'] | default('No IP') }})"
+
+    - name: "k8s main : check init status"
+      ansible.builtin.stat:
+        path: "/home/vagrant/.kube/config"
+      register: kube_config_file
+
+    - name: "k8s main : initialize cluster"
+      when: not kube_config_file.stat.exists
+      block:
+        - name: "k8s main : kubeadm init"
+          ansible.builtin.command:
+            cmd: >
+              kubeadm init
+                --apiserver-advertise-address {{ ansible_facts[net_interface]["ipv4"]["address"] }}
+                --control-plane-endpoint {{ ansible_facts[net_interface]["ipv4"]["address"] }}
+                --pod-network-cidr=10.244.0.0/16
+
+        - name: "k8s main : create .kube directory"
+          ansible.builtin.file:
+            path: "/home/vagrant/.kube"
+            state: "directory"
+
+        - name: "k8s main : copy admin.conf"
+          ansible.builtin.copy:
+            dest: "/home/vagrant/.kube/config"
+            group: "vagrant"
+            owner: "vagrant"
+            remote_src: true
+            src: "/etc/kubernetes/admin.conf"
+
+    - name: "k8s main : cluster networking : check flannel config file"
+      ansible.builtin.stat:
+        path: "./kube-flannel.yml"
+      register: flannel_config_file
+
+    - name: "k8s main : cluster networking"
+      when: not flannel_config_file.stat.exists
+      block:
+        - name: "k8s main : cluster networking : download flannel config file"
+          ansible.builtin.get_url:
+            dest: "./kube-flannel.yml"
+            url: "https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml"
+          register: flannel_config_file_download
+
+        - name: "k8s main : cluster networking : set network interface config in flannel"
+          ansible.builtin.lineinfile:
+            insertafter: "        - --kube-subnet-mgr"
+            line: "        - --iface={{ net_interface }}"
+            path: "{{ flannel_config_file_download.dest }}"
+
+        - name: "k8s main : cluster networking : install flannel pod network"
+          kubernetes.core.k8s:
+            kubeconfig: "/etc/kubernetes/admin.conf"
+            src: "{{ flannel_config_file_download.dest }}"
+            state: "present"
+
+    - name: "k8s main : cluster join instructions : check script"
+      ansible.builtin.stat:
+        path: "/vagrant/k8s/temp/join-cluster.sh"
+      register: join_script_file
+
+    - name: "k8s main : cluster join instructions"
+      when: not join_script_file.stat.exists
+      block:
+        - name: "k8s main : create temp directory"
+          ansible.builtin.file:
+            path: "/vagrant/k8s/temp"
+            state: "directory"
+
+        - name: "k8s main : cluster join instructions : generate"
+          ansible.builtin.command:
+            cmd: "kubeadm token create --print-join-command"
+          become: false
+          register: join_command
+
+        - name: "k8s main : cluster join instructions : create script"
+          ansible.builtin.copy:
+            content: "{{ join_command.stdout }}"
+            dest: "/vagrant/k8s/temp/join-cluster.sh"
+
+    - name: "k8s main : helm : check install"
+      ansible.builtin.command:
+        cmd: "helm version --short"
+      changed_when: false
+      failed_when: helm_check.rc not in [0, 2, 127]
+      register: helm_check
+
+    - name: "k8s main : helm"
+      when: helm_check.rc != 0
+      block:
+        - name: "k8s main : helm : download install script"
+          ansible.builtin.get_url:
+            dest: "/root/get-helm.sh"
+            group: "root"
+            mode: "0700"
+            owner: "root"
+            url: "https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3"
+
+        - name: "k8s main : helm : install"
+          ansible.builtin.command:
+            cmd: "/root/get-helm.sh"
+          delay: 10
+          register: helm_install
+          retries: 6
+          until: helm_install is success
+
+        - name: "k8s main : helm : install helm-diff plugin"
+          kubernetes.core.helm_plugin:
+            plugin_path: "https://github.com/databus23/helm-diff"
+            state: "present"
+          delay: 10
+          register: helm_diff_install
+          retries: 6
+          until: helm_diff_install is success
