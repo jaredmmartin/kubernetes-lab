@@ -1,4 +1,4 @@
-# k8s-lab
+# kubernetes-lab
 
 This repository contains automation to provision a Kubernetes cluster running the latest available version.
 
