@@ -12,7 +12,7 @@ config:
   themeVariables:
     fontFamily: 'monospace'
     fontSize: '12px'
-    lineColor: '#ededed'
+    lineColor: '#333'
     edgeLabelBackground: 'transparent'
 ---
 flowchart
@@ -23,30 +23,30 @@ flowchart
             %% Control plane
             subgraph node_control_plane_01 ["control plane"]
                 %% Services
-                service_apiserver["api server"]:::service
-                service_controller_manager["controller manager"]:::service
-                service_coredns["coredns"]:::service
-                service_etcd["etcd"]:::service
-                service_flannel["flannel"]:::service
-                service_proxy["kube-proxy"]:::service
-                service_scheduler["scheduler"]:::service
-                service_nfs_provisioner["nfs provisioner"]:::service
+                service_apiserver["api server"]:::system
+                service_controller_manager["controller manager"]:::system
+                service_coredns["coredns"]:::dns
+                service_etcd["etcd"]:::system
+                service_flannel["flannel"]:::system
+                service_proxy["kube-proxy"]:::system
+                service_scheduler["scheduler"]:::system
+                service_nfs_provisioner["nfs provisioner"]:::storage
 
                 %% Node links
                 service_controller_manager & service_coredns & service_etcd & service_flannel & service_proxy & service_scheduler & service_nfs_provisioner --> service_apiserver
             end
 
             %% Services
-            service_dns_client["dns client"]:::os
-            service_bind["bind dns server"]:::os
-            service_nfs_server["nfs server"]:::os
+            service_dns_client["dns client"]:::dns
+            service_bind["bind dns server"]:::dns
+            service_nfs_server["nfs server"]:::storage
 
             %% Persistent volumes
-            volume_nfs_1[("nfs volume")]:::volume
-            volume_nfs_2[("nfs volume")]:::volume
-            volume_nfs_3[("nfs volume")]:::volume
-            volume_nfs_4[("nfs volume")]:::volume
-            volume_nfs_5[("nfs volume")]:::volume
+            volume_nfs_1[("nfs volume")]:::storage
+            volume_nfs_2[("nfs volume")]:::storage
+            volume_nfs_3[("nfs volume")]:::storage
+            volume_nfs_4[("nfs volume")]:::storage
+            volume_nfs_5[("nfs volume")]:::storage
 
             %% Node links
             node_control_plane_01 --queries--> service_dns_client
@@ -58,7 +58,7 @@ flowchart
         %% Worker node
         subgraph vm_worker_1 ["k8s-worker## vm"]
             %% Services
-            service_dns_client_1["dns client"]:::os
+            service_dns_client_1["dns client"]:::dns
             
             %% Node links
             service_dns_client_1 --queries--> service_bind
@@ -67,8 +67,8 @@ flowchart
             %% Worker
             subgraph node_worker_1 ["worker node"]
                 %% Services
-                service_kubelet_1["kubelet"]:::service
-                service_kubeproxy_1["kube-proxy"]:::service
+                service_kubelet_1["kubelet"]:::system
+                service_kubeproxy_1["kube-proxy"]:::system
                 service_load_balancer_1["load balancer"]:::load_balancer
                 
                 subgraph node_worker_cri_1 ["cri"]
@@ -87,11 +87,11 @@ flowchart
                 end
 
                 %% Persistent volumes
-                pv_awx_1[("awx")]:::volume
-                pv_awx_postgres_1[("awx postgres")]:::volume
-                pv_consul_1[("consul")]:::volume
-                pv_jenkins_1[("jenkins")]:::volume
-                pv_vault_1[("vault")]:::volume
+                pv_awx_1[("awx")]:::storage
+                pv_awx_postgres_1[("awx postgres")]:::storage
+                pv_consul_1[("consul")]:::storage
+                pv_jenkins_1[("jenkins")]:::storage
+                pv_vault_1[("vault")]:::storage
 
                 %% Node links
                 service_kubelet_1 & service_kubeproxy_1 --> node_worker_cri_1
@@ -112,17 +112,19 @@ flowchart
         end
     end
 
-    %% Node styles
-    %%classDef os fill:#4bbbc3,stroke:#495057,stroke-width:1px,color:#fff
-    classDef cluster fill:#495057,stroke:#868e96,stroke-width:1px,color:#fff
-    classDef host fill:#343a40,stroke:#343a40,stroke-width:1px,color:#fff
-    classDef node fill:#212529,stroke:#212529,stroke-width:1px,color:#fff
-    classDef load_balancer fill:#4bc685,stroke:#4bc685,stroke-width:1px,color:#fff
-    classDef os fill:#6b3bb4,stroke:#495057,stroke-width:1px,color:#fff
-    classDef other fill:#4f87a0,stroke:#868e96,stroke-width:1px,color:#fff
-    classDef service fill:#4c6ef5,stroke:#4c6ef5,stroke-width:1px,color:#fff
-    classDef system fill:#37b24d,stroke:#495057,stroke-width:1px,color:#fff
-    classDef volume fill:#cb406c,stroke:#333,stroke-width:1px,color:#fff
+    %% node styles
+    classDef cluster fill:#f4f7fa,stroke:#ededed,stroke-width:1px,color:#333
+    classDef host fill:#cedae2,stroke:#cedae2,stroke-width:1px,color:#333
+    classDef node fill:#e8edf3,stroke:#e8edf3,stroke-width:1px,color:#333
+    classDef cri fill:#cedae2,stroke:#cedae2,stroke-width:1px,color:#333
+
+    classDef dns fill:#f59e0b,stroke:#f59e0b,stroke-width:1px,color:#fff
+    classDef load_balancer fill:#fcd34d,stroke:#fcd34d,stroke-width:1px,color:#422006
+    classDef os fill:#5b21b6,stroke:#5b21b6,stroke-width:1px,color:#fff
+    classDef other fill:#4f87a0,stroke:#4f87a0,stroke-width:1px,color:#fff
+    classDef service fill:#16a34a,stroke:#16a34a,stroke-width:1px,color:#fff
+    classDef system fill:#2563eb,stroke:#2563eb,stroke-width:1px,color:#fff
+    classDef storage fill:#7c3aed,stroke:#333333,stroke-width:1px,color:#fff
 
     %%cb406c
     %% Assign group styles
@@ -131,6 +133,7 @@ flowchart
     node_control_plane_01:::node
     node_worker_1:::node
     cluster:::cluster
+    node_worker_cri_1:::cri
 
     %% Link styles
     classDef animate_fast stroke-dasharray: 7,1,stroke-dashoffset: 500,animation: dash 45s linear infinite
