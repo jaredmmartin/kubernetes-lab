@@ -56,7 +56,7 @@ flowchart
         end
 
         %% Worker node
-        subgraph vm_worker_1 ["k8s-worker## vm"]
+        subgraph vm_worker_1 ["k8s-worker## vms"]
             %% Services
             service_dns_client_1["dns client"]:::dns
             
