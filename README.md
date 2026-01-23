@@ -254,7 +254,7 @@ Several services use the NFS Provisioner to provision NFS-based persistent volum
 
 - Physical host
   - Hardware
-    - 4+ vCPU
+    - 4+ CPU
     - 32+ GB RAM
     - 15+ GB available storage
       - The VirtualBox VMs are provisioned as linked clones to conserve disk space.
