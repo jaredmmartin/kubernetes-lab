@@ -282,7 +282,7 @@ The `packer` directory contains a Packer template to build Vagrant box for Virtu
     cd packer/ubuntu-server-24.04/
 
     # Build the box
-    packer init
+    packer init .
     ```
 
 1. Build the Vagrant box:
