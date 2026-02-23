@@ -275,10 +275,6 @@ Several services use the NFS Provisioner to provision NFS-based persistent volum
 
 The `packer` directory contains a Packer template to build Vagrant box for VirtualBox with Ubuntu Server 24.04 LTS. The Vagrant box is used as base image for each of the Kubernetes cluster VMs.
 
-The Vagrant box build takes approximately 15 minutes, but may vary depending on your hardware and internet connection.
-
-The box file is output to  `packer/ubuntu-server-24.04/ubuntu-server-24.04.box` and is approximately 2.5 GBs.
-
 1. Build the Vagrant box:
 
     ```shell
