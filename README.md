@@ -275,6 +275,16 @@ Several services use the NFS Provisioner to provision NFS-based persistent volum
 
 The `packer` directory contains a Packer template to build Vagrant box for VirtualBox with Ubuntu Server 24.04 LTS. The Vagrant box is used as base image for each of the Kubernetes cluster VMs.
 
+1. Initialize the build
+
+    ```shell
+    # Set working directory
+    cd packer/ubuntu-server-24.04/
+
+    # Build the box
+    packer init
+    ```
+
 1. Build the Vagrant box:
 
     ```shell
